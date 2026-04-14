@@ -5,8 +5,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
+import importlib.util
+from pathlib import Path
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.svm import SVR
+from sklearn.preprocessing import MinMaxScaler
 from services.data_loader import load_data
 from models.lstm_model import lstm_predict
+from models.random_forest_model import random_forest_predict
+from models.linear_regression_model import linear_regression_predict
+from models.svm_model import svm_predict
 from visuals import plots
 from utils.indicator_info import display_all_indicators_info, get_quick_reference
 import matplotlib.pyplot as plt
@@ -21,9 +30,42 @@ popular_stocks = [
 ]
 
 # Create navigation tabs
-page = st.sidebar.radio("Navigation", ["📈 Analysis", "🔄 Compare Stocks", "📚 Indicators Info"])
+page = st.sidebar.radio("Navigation", ["📈 Analysis", "🔄 Compare Stocks", "📚 Indicators Info", "🧪 ML Model Results"])
 
 st.title("📈 Stock Market Prediction & Recommendation")
+
+
+def load_metrics_evaluator():
+    """Load metrics module from path containing spaces."""
+    metrics_path = Path(__file__).parent / "Results for ML_models" / "metrics_evaluator.py"
+    spec = importlib.util.spec_from_file_location("metrics_evaluator", str(metrics_path))
+    if spec is None or spec.loader is None:
+        raise ImportError("Unable to load metrics evaluator module")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_supervised_dataset(prices, seq_len=10):
+    """Create sliding-window features and targets for classic ML models."""
+    if seq_len < 1:
+        raise ValueError("Sequence length must be at least 1")
+    if len(prices) <= seq_len:
+        raise ValueError(f"Need more than {seq_len} points, got {len(prices)}")
+
+    X, y = [], []
+    for i in range(len(prices) - seq_len):
+        X.append(prices[i:i + seq_len])
+        y.append(prices[i + seq_len])
+
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.float32)
+
+    if X.ndim != 2 or X.shape[1] < 1:
+        raise ValueError(f"Invalid feature matrix shape: {X.shape}")
+
+    return X, y
 
 
 def process_stock(ticker, start_date, end_date, price_type, forecast_days):
@@ -239,6 +281,164 @@ if page == "📚 Indicators Info":
         - Identify consolidation periods
         - Portfolio risk assessment
         """)
+
+# ============= COMPARISON PAGE =============
+elif page == "🧪 ML Model Results":
+    st.header("🧪 ML Model Results")
+    st.write("Compare ML model performance using RMSE, R2, RSS, MAPE, F-Measure, and Confusion Matrix.")
+
+    st.sidebar.header("ML Results Settings")
+
+    ml_ticker = st.sidebar.selectbox("Stock", popular_stocks, key="ml_ticker")
+    ml_price_type = st.sidebar.radio("Price Type", ["Close", "Open"], index=0, key="ml_price_type")
+
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        ml_start = st.date_input("Start Date", value=None, key="ml_start_date")
+    with col2:
+        ml_end = st.date_input("End Date", value=None, key="ml_end_date")
+
+    ml_forecast_days = st.sidebar.slider("Forecast Days", 5, 60, 30, key="ml_forecast_days")
+
+    selected_models = st.sidebar.multiselect(
+        "Select Models",
+        ["Random Forest", "Linear Regression", "SVM"],
+        default=["Random Forest", "Linear Regression", "SVM"],
+        key="ml_selected_models"
+    )
+
+    if st.sidebar.button("📊 Run ML Results", key="ml_results_btn"):
+        if not selected_models:
+            st.error("❌ Please select at least one ML model")
+        elif ml_start is None or ml_end is None:
+            st.error("❌ Please select both start and end dates")
+        elif ml_start >= ml_end:
+            st.error("❌ Start date must be before end date")
+        else:
+            try:
+                st.info(f"📥 Loading {ml_ticker} data from {ml_start} to {ml_end}...")
+                df = load_data(ml_ticker, ml_start, ml_end)
+
+                if df.empty:
+                    st.error("❌ No data found for the selected stock/date range")
+                else:
+                    metrics_module = load_metrics_evaluator()
+                    evaluate_model_performance = metrics_module.evaluate_model_performance
+
+                    prices = df[ml_price_type].values.astype(float)
+                    prices = np.nan_to_num(prices, nan=np.nanmean(prices[~np.isnan(prices)]))
+                    scaler = MinMaxScaler(feature_range=(0, 1))
+                    prices_scaled = scaler.fit_transform(prices.reshape(-1, 1)).flatten()
+                    seq_len = 10
+                    X_eval, y_eval = build_supervised_dataset(prices_scaled, seq_len=seq_len)
+
+                    model_functions = {
+                        "Random Forest": random_forest_predict,
+                        "Linear Regression": linear_regression_predict,
+                        "SVM": svm_predict,
+                    }
+
+                    metrics_models = {
+                        "Random Forest": RandomForestRegressor(n_estimators=100, random_state=42),
+                        "Linear Regression": LinearRegression(),
+                        "SVM": SVR(kernel='rbf', C=1e3, gamma=0.1),
+                    }
+
+                    summary_rows = []
+                    model_outputs = {}
+
+                    for model_name in selected_models:
+                        try:
+                            # In-sample evaluation on historical windows
+                            eval_model = metrics_models[model_name]
+                            eval_model.fit(X_eval, y_eval)
+                            y_pred_eval_scaled = eval_model.predict(X_eval)
+                            y_true_eval = scaler.inverse_transform(y_eval.reshape(-1, 1)).flatten()
+                            y_pred_eval = scaler.inverse_transform(y_pred_eval_scaled.reshape(-1, 1)).flatten()
+                            metrics = evaluate_model_performance(y_true_eval, y_pred_eval)
+
+                            # Keep dedicated model function for forward forecast output
+                            result = model_functions[model_name](df, ml_price_type, ml_forecast_days)
+                            if "error" in result:
+                                st.warning(f"⚠️ {model_name} forecast failed: {result['error']}")
+                                forecast_preds = np.array([], dtype=float)
+                            else:
+                                forecast_preds = np.array(result.get("predictions", []), dtype=float)
+
+                            model_outputs[model_name] = {
+                                "predictions": y_pred_eval,
+                                "actual": y_true_eval,
+                                "metrics": metrics,
+                                "forecast": forecast_preds,
+                            }
+
+                            summary_rows.append({
+                                "Model": model_name,
+                                "RMSE": metrics["RMSE"],
+                                "R2": metrics["R2_Score"],
+                                "RSS": metrics["RSS"],
+                                "MAPE (%)": metrics["MAPE"] * 100,
+                                "F-Measure": metrics["F_Measure"],
+                            })
+                        except Exception as model_error:
+                            st.warning(f"⚠️ {model_name} failed: {str(model_error)}")
+                            continue
+
+                    if not summary_rows:
+                        st.error("❌ No model results were generated")
+                    else:
+                        st.subheader("📋 Model Metrics Summary")
+                        summary_df = pd.DataFrame(summary_rows).sort_values("RMSE")
+                        st.dataframe(summary_df, use_container_width=True)
+
+                        st.subheader("🔍 Detailed Metrics")
+                        for model_name, output in model_outputs.items():
+                            with st.expander(f"{model_name} Details", expanded=False):
+                                metrics = output["metrics"]
+
+                                c1, c2, c3 = st.columns(3)
+                                with c1:
+                                    st.metric("RMSE", f"{metrics['RMSE']:.4f}")
+                                    st.metric("RSS", f"{metrics['RSS']:.4f}")
+                                with c2:
+                                    st.metric("R2", f"{metrics['R2_Score']:.4f}")
+                                    st.metric("MAPE", f"{metrics['MAPE'] * 100:.2f}%")
+                                with c3:
+                                    st.metric("F-Measure", f"{metrics['F_Measure']:.4f}")
+
+                                conf_df = pd.DataFrame(
+                                    metrics["Confusion_Matrix"],
+                                    index=["Actual Down", "Actual Up"],
+                                    columns=["Pred Down", "Pred Up"]
+                                )
+                                st.write("Confusion Matrix (Direction of price movement)")
+                                st.dataframe(conf_df, use_container_width=True)
+
+                                lookback = len(output["predictions"])
+                                pred_dates = df.index[seq_len:seq_len + lookback]
+
+                                fig, ax = plt.subplots(figsize=(12, 5))
+                                ax.plot(pred_dates, output["actual"], label="Actual", linewidth=2)
+                                ax.plot(pred_dates, output["predictions"], label="Predicted", linewidth=2, linestyle="--")
+                                ax.set_title(f"{model_name}: Actual vs Predicted ({ml_ticker})")
+                                ax.set_xlabel("Date")
+                                ax.set_ylabel("Price ($)")
+                                ax.legend()
+                                ax.grid(True, alpha=0.3)
+                                st.pyplot(fig)
+                                plt.close(fig)
+
+                                if len(output["forecast"]) > 0:
+                                    st.write("Forecast Preview")
+                                    future_dates = pd.date_range(df.index[-1], periods=len(output["forecast"]) + 1, freq='D')[1:]
+                                    forecast_df = pd.DataFrame({
+                                        "Date": future_dates,
+                                        "Forecast": output["forecast"]
+                                    })
+                                    st.dataframe(forecast_df.head(10), use_container_width=True)
+
+            except Exception as e:
+                st.error(f"❌ Error generating ML results: {str(e)}")
 
 # ============= COMPARISON PAGE =============
 elif page == "🔄 Compare Stocks":
