@@ -13,9 +13,6 @@ from sklearn.svm import SVR
 from sklearn.preprocessing import MinMaxScaler
 from services.data_loader import load_data
 from models.lstm_model import lstm_predict
-from models.random_forest_model import random_forest_predict
-from models.linear_regression_model import linear_regression_predict
-from models.svm_model import svm_predict
 from visuals import plots
 from utils.indicator_info import display_all_indicators_info, get_quick_reference
 import matplotlib.pyplot as plt
@@ -66,6 +63,99 @@ def build_supervised_dataset(prices, seq_len=10):
         raise ValueError(f"Invalid feature matrix shape: {X.shape}")
 
     return X, y
+
+
+def sanitize_prices(prices):
+    """Replace NaNs in a price array with the series mean."""
+    prices = np.array(prices, dtype=float)
+    valid = prices[~np.isnan(prices)]
+    if len(valid) == 0:
+        raise ValueError("Price series has no valid values")
+    return np.nan_to_num(prices, nan=np.nanmean(valid))
+
+
+def build_multiticker_training_dataset(training_frames, price_type, seq_len=10):
+    """Build one normalized training set by concatenating windows from multiple tickers."""
+    X_parts, y_parts = [], []
+    used_tickers = []
+
+    for ticker, df in training_frames.items():
+        if price_type not in df.columns:
+            continue
+
+        prices = sanitize_prices(df[price_type].values)
+        if len(prices) <= seq_len:
+            continue
+
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        prices_scaled = scaler.fit_transform(prices.reshape(-1, 1)).flatten()
+        X_ticker, y_ticker = build_supervised_dataset(prices_scaled, seq_len=seq_len)
+
+        X_parts.append(X_ticker)
+        y_parts.append(y_ticker)
+        used_tickers.append(ticker)
+
+    if not X_parts:
+        raise ValueError("No valid training windows were created from selected datasets")
+
+    X_train = np.vstack(X_parts)
+    y_train = np.concatenate(y_parts)
+    return X_train, y_train, used_tickers
+
+
+def run_multiticker_model(
+    model,
+    training_frames,
+    target_df,
+    price_type,
+    forecast_days,
+    seq_len,
+    evaluate_model_performance,
+):
+    """Train on multiple ticker datasets and evaluate/forecast on the target ticker."""
+    X_train, y_train, used_tickers = build_multiticker_training_dataset(
+        training_frames,
+        price_type,
+        seq_len=seq_len,
+    )
+
+    if price_type not in target_df.columns:
+        raise ValueError(f"Column '{price_type}' not found in target dataset")
+
+    target_prices = sanitize_prices(target_df[price_type].values)
+    if len(target_prices) <= seq_len:
+        raise ValueError(f"Need more than {seq_len} target points, got {len(target_prices)}")
+
+    target_scaler = MinMaxScaler(feature_range=(0, 1))
+    target_scaled = target_scaler.fit_transform(target_prices.reshape(-1, 1)).flatten()
+    X_eval, y_eval = build_supervised_dataset(target_scaled, seq_len=seq_len)
+
+    model.fit(X_train, y_train)
+
+    y_pred_eval_scaled = model.predict(X_eval)
+    y_true_eval = target_scaler.inverse_transform(y_eval.reshape(-1, 1)).flatten()
+    y_pred_eval = target_scaler.inverse_transform(y_pred_eval_scaled.reshape(-1, 1)).flatten()
+    metrics = evaluate_model_performance(y_true_eval, y_pred_eval)
+
+    last_sequence = target_scaled[-seq_len:].copy()
+    forecast_scaled = []
+    for _ in range(forecast_days):
+        next_scaled = model.predict(last_sequence.reshape(1, -1))[0]
+        forecast_scaled.append(next_scaled)
+        last_sequence = np.append(last_sequence[1:], next_scaled)
+
+    forecast = target_scaler.inverse_transform(
+        np.array(forecast_scaled).reshape(-1, 1)
+    ).flatten()
+
+    return {
+        "predictions": y_pred_eval,
+        "actual": y_true_eval,
+        "metrics": metrics,
+        "forecast": forecast,
+        "used_tickers": used_tickers,
+        "train_samples": len(X_train),
+    }
 
 
 def process_stock(ticker, start_date, end_date, price_type, forecast_days):
@@ -300,6 +390,21 @@ elif page == "🧪 ML Model Results":
 
     ml_forecast_days = st.sidebar.slider("Forecast Days", 5, 60, 30, key="ml_forecast_days")
 
+    default_training_tickers = [ml_ticker]
+    for candidate in ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]:
+        if candidate not in default_training_tickers:
+            default_training_tickers.append(candidate)
+        if len(default_training_tickers) == 3:
+            break
+
+    training_tickers = st.sidebar.multiselect(
+        "Training Datasets (3+ yfinance tickers)",
+        popular_stocks,
+        default=default_training_tickers,
+        key="ml_training_tickers",
+        help="Select at least 3 ticker datasets to train the model, then evaluate on the selected stock.",
+    )
+
     selected_models = st.sidebar.multiselect(
         "Select Models",
         ["Random Forest", "Linear Regression", "SVM"],
@@ -310,79 +415,78 @@ elif page == "🧪 ML Model Results":
     if st.sidebar.button("📊 Run ML Results", key="ml_results_btn"):
         if not selected_models:
             st.error("❌ Please select at least one ML model")
+        elif len(training_tickers) < 3:
+            st.error("❌ Please select at least 3 training datasets")
         elif ml_start is None or ml_end is None:
             st.error("❌ Please select both start and end dates")
         elif ml_start >= ml_end:
             st.error("❌ Start date must be before end date")
         else:
             try:
-                st.info(f"📥 Loading {ml_ticker} data from {ml_start} to {ml_end}...")
-                df = load_data(ml_ticker, ml_start, ml_end)
+                st.info(f"📥 Loading target and training datasets from yfinance ({ml_start} to {ml_end})...")
+                target_df = load_data(ml_ticker, ml_start, ml_end)
 
-                if df.empty:
-                    st.error("❌ No data found for the selected stock/date range")
+                if target_df.empty:
+                    st.error("❌ No data found for the selected prediction stock/date range")
                 else:
-                    metrics_module = load_metrics_evaluator()
-                    evaluate_model_performance = metrics_module.evaluate_model_performance
-
-                    prices = df[ml_price_type].values.astype(float)
-                    prices = np.nan_to_num(prices, nan=np.nanmean(prices[~np.isnan(prices)]))
-                    scaler = MinMaxScaler(feature_range=(0, 1))
-                    prices_scaled = scaler.fit_transform(prices.reshape(-1, 1)).flatten()
-                    seq_len = 10
-                    X_eval, y_eval = build_supervised_dataset(prices_scaled, seq_len=seq_len)
-
-                    model_functions = {
-                        "Random Forest": random_forest_predict,
-                        "Linear Regression": linear_regression_predict,
-                        "SVM": svm_predict,
-                    }
-
-                    metrics_models = {
-                        "Random Forest": RandomForestRegressor(n_estimators=100, random_state=42),
-                        "Linear Regression": LinearRegression(),
-                        "SVM": SVR(kernel='rbf', C=1e3, gamma=0.1),
-                    }
-
-                    summary_rows = []
-                    model_outputs = {}
-
-                    for model_name in selected_models:
-                        try:
-                            # In-sample evaluation on historical windows
-                            eval_model = metrics_models[model_name]
-                            eval_model.fit(X_eval, y_eval)
-                            y_pred_eval_scaled = eval_model.predict(X_eval)
-                            y_true_eval = scaler.inverse_transform(y_eval.reshape(-1, 1)).flatten()
-                            y_pred_eval = scaler.inverse_transform(y_pred_eval_scaled.reshape(-1, 1)).flatten()
-                            metrics = evaluate_model_performance(y_true_eval, y_pred_eval)
-
-                            # Keep dedicated model function for forward forecast output
-                            result = model_functions[model_name](df, ml_price_type, ml_forecast_days)
-                            if "error" in result:
-                                st.warning(f"⚠️ {model_name} forecast failed: {result['error']}")
-                                forecast_preds = np.array([], dtype=float)
-                            else:
-                                forecast_preds = np.array(result.get("predictions", []), dtype=float)
-
-                            model_outputs[model_name] = {
-                                "predictions": y_pred_eval,
-                                "actual": y_true_eval,
-                                "metrics": metrics,
-                                "forecast": forecast_preds,
-                            }
-
-                            summary_rows.append({
-                                "Model": model_name,
-                                "RMSE": metrics["RMSE"],
-                                "R2": metrics["R2_Score"],
-                                "RSS": metrics["RSS"],
-                                "MAPE (%)": metrics["MAPE"] * 100,
-                                "F-Measure": metrics["F_Measure"],
-                            })
-                        except Exception as model_error:
-                            st.warning(f"⚠️ {model_name} failed: {str(model_error)}")
+                    training_frames = {}
+                    for train_ticker in training_tickers:
+                        train_df = load_data(train_ticker, ml_start, ml_end)
+                        if train_df.empty:
+                            st.warning(f"⚠️ No data found for training dataset: {train_ticker}")
                             continue
+                        training_frames[train_ticker] = train_df
+
+                    if len(training_frames) < 3:
+                        st.error("❌ Could not load at least 3 training datasets. Adjust tickers/date range and retry.")
+                    else:
+                        metrics_module = load_metrics_evaluator()
+                        evaluate_model_performance = metrics_module.evaluate_model_performance
+                        seq_len = 10
+
+                        model_builders = {
+                            "Random Forest": lambda: RandomForestRegressor(n_estimators=100, random_state=42),
+                            "Linear Regression": LinearRegression,
+                            "SVM": lambda: SVR(kernel='rbf', C=1e3, gamma=0.1),
+                        }
+
+                        summary_rows = []
+                        model_outputs = {}
+
+                        st.success(
+                            f"✅ Loaded {len(training_frames)} training datasets. "
+                            f"Predicting {ml_ticker} from yfinance data."
+                        )
+
+                        for model_name in selected_models:
+                            try:
+                                model = model_builders[model_name]()
+                                output = run_multiticker_model(
+                                    model=model,
+                                    training_frames=training_frames,
+                                    target_df=target_df,
+                                    price_type=ml_price_type,
+                                    forecast_days=ml_forecast_days,
+                                    seq_len=seq_len,
+                                    evaluate_model_performance=evaluate_model_performance,
+                                )
+
+                                metrics = output["metrics"]
+                                model_outputs[model_name] = output
+
+                                summary_rows.append({
+                                    "Model": model_name,
+                                    "Train Datasets": len(output["used_tickers"]),
+                                    "Train Samples": output["train_samples"],
+                                    "RMSE": metrics["RMSE"],
+                                    "R2": metrics["R2_Score"],
+                                    "RSS": metrics["RSS"],
+                                    "MAPE (%)": metrics["MAPE"] * 100,
+                                    "F-Measure": metrics["F_Measure"],
+                                })
+                            except Exception as model_error:
+                                st.warning(f"⚠️ {model_name} failed: {str(model_error)}")
+                                continue
 
                     if not summary_rows:
                         st.error("❌ No model results were generated")
@@ -414,8 +518,13 @@ elif page == "🧪 ML Model Results":
                                 st.write("Confusion Matrix (Direction of price movement)")
                                 st.dataframe(conf_df, use_container_width=True)
 
+                                st.write(
+                                    f"Training datasets used: {', '.join(output['used_tickers'])} "
+                                    f"({output['train_samples']} windows)"
+                                )
+
                                 lookback = len(output["predictions"])
-                                pred_dates = df.index[seq_len:seq_len + lookback]
+                                pred_dates = target_df.index[seq_len:seq_len + lookback]
 
                                 fig, ax = plt.subplots(figsize=(12, 5))
                                 ax.plot(pred_dates, output["actual"], label="Actual", linewidth=2)
@@ -430,7 +539,7 @@ elif page == "🧪 ML Model Results":
 
                                 if len(output["forecast"]) > 0:
                                     st.write("Forecast Preview")
-                                    future_dates = pd.date_range(df.index[-1], periods=len(output["forecast"]) + 1, freq='D')[1:]
+                                    future_dates = pd.date_range(target_df.index[-1], periods=len(output["forecast"]) + 1, freq='D')[1:]
                                     forecast_df = pd.DataFrame({
                                         "Date": future_dates,
                                         "Forecast": output["forecast"]
