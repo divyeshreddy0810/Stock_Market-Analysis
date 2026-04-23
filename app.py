@@ -12,12 +12,12 @@ from sklearn.linear_model import LinearRegression
 from sklearn.svm import SVR
 from sklearn.preprocessing import MinMaxScaler
 from services.data_loader import load_data
-from models.lstm_model import lstm_predict
+from models.random_forest_model import random_forest_predict
 from visuals import plots
 from utils.indicator_info import display_all_indicators_info, get_quick_reference
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Stock LSTM + RL Predictor", layout="wide")
+st.set_page_config(page_title="Stock Random Forest Predictor", layout="wide")
 
 # Popular stocks list
 popular_stocks = [
@@ -30,6 +30,13 @@ popular_stocks = [
 page = st.sidebar.radio("Navigation", ["📈 Analysis", "🔄 Compare Stocks", "📚 Indicators Info", "🧪 ML Model Results"])
 
 st.title("📈 Stock Market Prediction & Recommendation")
+
+TRAINING_WINDOW_YEARS = 3
+
+
+def get_training_start_date(end_date, years=TRAINING_WINDOW_YEARS):
+    """Return training start date for a rolling N-year window ending at end_date."""
+    return end_date - datetime.timedelta(days=365 * years)
 
 
 def load_metrics_evaluator():
@@ -181,9 +188,23 @@ def process_stock(ticker, start_date, end_date, price_type, forecast_days):
             st.pyplot(fig)
             plt.close(fig)
             
-            # Train model
-            st.info(f"🤖 Training ensemble model...")
-            actual, pred, forecast, rmse, mape = lstm_predict(df, price_type, forecast_days)
+            # Train model on past N years ending at selected end date.
+            training_start = get_training_start_date(end_date)
+            st.info(
+                f"🤖 Training model on past {TRAINING_WINDOW_YEARS} years "
+                f"({training_start} to {end_date})..."
+            )
+            training_df = load_data(ticker, training_start, end_date)
+            if training_df.empty:
+                st.error("❌ Unable to load enough training data for model training")
+                return
+
+            actual, pred, forecast, rmse, mape = random_forest_predict(
+                training_df,
+                price_type,
+                forecast_days,
+                evaluation_df=df,
+            )
             st.success("✅ Model trained successfully!")
             
             # Show metrics
@@ -388,6 +409,10 @@ elif page == "🧪 ML Model Results":
     with col2:
         ml_end = st.date_input("End Date", value=None, key="ml_end_date")
 
+    st.sidebar.caption(
+        f"Model training uses past {TRAINING_WINDOW_YEARS} years ending at selected End Date."
+    )
+
     ml_forecast_days = st.sidebar.slider("Forecast Days", 5, 60, 30, key="ml_forecast_days")
 
     default_training_tickers = [ml_ticker]
@@ -423,7 +448,11 @@ elif page == "🧪 ML Model Results":
             st.error("❌ Start date must be before end date")
         else:
             try:
-                st.info(f"📥 Loading target and training datasets from yfinance ({ml_start} to {ml_end})...")
+                ml_train_start = get_training_start_date(ml_end)
+                st.info(
+                    f"📥 Loading target data ({ml_start} to {ml_end}) and training window "
+                    f"({ml_train_start} to {ml_end}) from yfinance..."
+                )
                 target_df = load_data(ml_ticker, ml_start, ml_end)
 
                 if target_df.empty:
@@ -431,7 +460,7 @@ elif page == "🧪 ML Model Results":
                 else:
                     training_frames = {}
                     for train_ticker in training_tickers:
-                        train_df = load_data(train_ticker, ml_start, ml_end)
+                        train_df = load_data(train_ticker, ml_train_start, ml_end)
                         if train_df.empty:
                             st.warning(f"⚠️ No data found for training dataset: {train_ticker}")
                             continue
@@ -455,7 +484,7 @@ elif page == "🧪 ML Model Results":
 
                         st.success(
                             f"✅ Loaded {len(training_frames)} training datasets. "
-                            f"Predicting {ml_ticker} from yfinance data."
+                            f"Predicting {ml_ticker} using target range {ml_start} to {ml_end}."
                         )
 
                         for model_name in selected_models:
@@ -666,12 +695,16 @@ else:
 
     price_type = st.sidebar.radio("Price Type", ["Close", "Open"], index=0)
 
-    # Date inputs - explicitly set to None to clear cache
+    # Date inputs
     col1, col2 = st.sidebar.columns(2)
     with col1:
         start_date = st.date_input("Start Date", value=None, key="start_date_input")
     with col2:
         end_date = st.date_input("End Date", value=None, key="end_date_input")
+
+    st.sidebar.caption(
+        f"Model training uses past {TRAINING_WINDOW_YEARS} years ending at selected End Date."
+    )
 
     forecast_days = st.sidebar.slider("Forecast Days", 1, 60, 30)
 
